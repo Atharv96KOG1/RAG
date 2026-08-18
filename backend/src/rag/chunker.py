@@ -5,6 +5,7 @@ from docling_core.types.doc import DocItemLabel
 
 from src.core.config import settings
 from src.core.errors import EmptyDocumentError
+from src.rag.document_parser import picture_image_filename
 
 
 def _concrete_items_by_ref(doc):
@@ -41,6 +42,37 @@ def _picture_text(item, doc):
 
 def _item_page(item):
     return item.prov[0].page_no if item.prov else None
+
+
+_EMPTY_BBOX = {"left": 0.0, "top": 0.0, "width": 0.0, "height": 0.0}
+
+
+def _chunk_bbox_fraction(doc_items, doc, page):
+    """Union bounding box of every doc_item in this chunk, as a fraction (0-1) of the
+    page's own width/height — resolution-independent, so the frontend can position a
+    highlight over the actual PDF.js-rendered page at any zoom level. width == 0 is the
+    "no bbox available" sentinel (not None — see the image_path comment below on why
+    Milvus can't infer a field's type from an all/mostly-None column); a real bbox
+    always has positive width, so callers just check `width > 0`."""
+    if page is None or page not in doc.pages:
+        return _EMPTY_BBOX
+    boxes = [item.prov[0].bbox for item in doc_items if item.prov and item.prov[0].page_no == page]
+    if not boxes:
+        return _EMPTY_BBOX
+
+    page_size = doc.pages[page].size
+    if page_size.width <= 0 or page_size.height <= 0:
+        return _EMPTY_BBOX
+
+    top_left = [b.to_top_left_origin(page_size.height) for b in boxes]
+    left, top = min(b.l for b in top_left), min(b.t for b in top_left)
+    right, bottom = max(b.r for b in top_left), max(b.b for b in top_left)
+    return {
+        "left": max(0.0, left / page_size.width),
+        "top": max(0.0, top / page_size.height),
+        "width": max(0.0, (right - left) / page_size.width),
+        "height": max(0.0, (bottom - top) / page_size.height),
+    }
 
 
 def _overlap_tail(text, fraction=None):
@@ -90,6 +122,10 @@ def chunk_document(doc, cache_path):
         if table_items:
             text = "\n\n".join(t.export_to_markdown(doc) for t in table_items)
             content_type = "table"
+            image_filename = ""  # not None — Milvus infers a metadata field's schema type from its
+            # sampled values, and can't infer one from an all-None/mostly-None field (this is a
+            # picture-only field, so most chunks have nothing here); "" is falsy just like None for
+            # every `if image_path` check downstream, but gives Milvus a stable VARCHAR to infer.
         elif picture_items:
             picture_texts = [_picture_text(p, doc) for p in picture_items]
             picture_texts = [t for t in picture_texts if t]
@@ -97,12 +133,19 @@ def chunk_document(doc, cache_path):
                 continue  # picture with no caption, no VLM description, no OCR text — nothing to embed
             text = "\n\n".join(picture_texts)
             content_type = "picture"
+            # First picture's persisted crop (see document_parser._process_pictures) —
+            # lets a chat citation for this chunk point straight at the actual image
+            # instead of only the whole PDF page.
+            image_filename = picture_image_filename(picture_items[0])
         else:
             # DocItem stubs already carry a populated `label` field directly — no need
             # for the table/picture self_ref indirection above to detect list content.
             is_list = any(getattr(item, "label", None) == DocItemLabel.LIST_ITEM for item in doc_items)
             text = chunker.contextualize(c)
             content_type = "list" if is_list else "text"
+            image_filename = ""
+
+        bbox = _chunk_bbox_fraction(doc_items, doc, page)
 
         bodies.append(text)
         chunk_metas.append(
@@ -115,6 +158,11 @@ def chunk_document(doc, cache_path):
                 "content_type": content_type,
                 "has_table": content_type == "table",
                 "has_picture": content_type == "picture",
+                "image_path": image_filename,
+                "bbox_left": bbox["left"],
+                "bbox_top": bbox["top"],
+                "bbox_width": bbox["width"],
+                "bbox_height": bbox["height"],
             }
         )
 

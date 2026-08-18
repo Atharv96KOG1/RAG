@@ -22,6 +22,21 @@ class Settings(BaseSettings):
         env_file=(str(BASE_DIR.parent / ".env"), str(BASE_DIR / ".env")), extra="ignore"
     )
     openai_api_key: str | None = None
+    # Qwen3-VL-8B via OpenRouter (OpenAI-compatible endpoint) — replaces the local
+    # SmolVLM picture captioner and handles multimodal answers ("show me the diagram
+    # and explain it") by seeing the actual figure crop, not just a text caption of it.
+    # Additive: with no key set, ingestion/chat just fall back to OCR-only/text-only.
+    openrouter_api_key: str | None = None
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    vision_model_name: str = "qwen/qwen3-vl-8b-instruct"
+    # Single shared login (no user DB) — matches this app's existing single-tenant
+    # design (see api/state.py's own comment on that). Every non-auth route requires
+    # a valid JWT issued by POST /api/auth/login against these credentials.
+    jwt_secret_key: str = "change-me"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 1440
+    auth_username: str = "admin"
+    auth_password: str = "admin"
     milvus_uri: str = "http://localhost:19530"
     collection_prefix: str = "rag_doc_"
     data_dir: Path = BASE_DIR / "data"
@@ -29,6 +44,12 @@ class Settings(BaseSettings):
     source_path: Path = BASE_DIR / "data" / "26-004-crm-software-rfp-package.pdf"
     embed_model_name: str = "BAAI/bge-m3"
     reranker_model_name: str = "BAAI/bge-reranker-v2-m3"
+    # Cross-attention cost scales with input length, and chunks run up to
+    # chunk_max_tokens (1024) — reranking 25 candidates at full length measured at
+    # ~4-5s per query. A reranker only needs enough text to judge relevance, not the
+    # whole chunk, so truncating here (this doesn't affect what the LLM sees, only
+    # what the reranker scores) is a real speed win, not just a cache/warm-up fix.
+    reranker_max_length: int = 384
     llm_model_name: str = "gpt-4o-mini"
     chunk_max_tokens: int = 1024
     text_overlap_fraction: float = 0.15
@@ -36,6 +57,11 @@ class Settings(BaseSettings):
     bm25_retriever_k: int = 10
     hybrid_weights: list[float] = [0.6, 0.4]
     rerank_top_n: int = 8
+    # Sigmoid'd cross-encoder score (see retriever.ScoredCrossEncoderReranker) below
+    # which the top retrieved chunk is treated as "not actually relevant" — the answer
+    # chain refuses instead of generating from context that doesn't support the
+    # question, which is what let an unrelated chunk get hallucinated into an answer.
+    min_relevance_score: float = 0.15
     graph_entity_types: list[str] = ["person", "organization", "product", "location", "concept", "date", "other"]
     graph_overlap_entity_types: list[str] = ["person", "organization", "product", "location"]
     graph_group_max_tokens: int = 2500

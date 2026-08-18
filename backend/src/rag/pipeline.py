@@ -9,6 +9,7 @@ from src.rag.graph_builder import build_combined_graph, build_document_graph, ca
 from src.rag.rag_chain import build_rag_chain, load_llm
 from src.rag.retriever import build_graph_expanded_retriever, build_reranked_retriever, capture_sources
 from src.rag.vector_store import build_vectorstore
+from src.rag.vision import load_vision_llm
 
 try:
     from langchain_classic.retrievers import EnsembleRetriever
@@ -112,7 +113,8 @@ def build_combined_chain(ingested_docs, device):
     retriever = capture_sources(retriever, sources_box)
 
     llm = load_llm()
-    rag_chain = build_rag_chain(retriever, llm)
+    vision_llm = load_vision_llm()  # None if OPENROUTER_API_KEY isn't set — falls back to text-only answers
+    rag_chain = build_rag_chain(retriever, llm, vision_llm, sources_box)
 
     return rag_chain, _merge_doc_metadata(ingested_docs), combined_graph, touched_box, sources_box
 

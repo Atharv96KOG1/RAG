@@ -1,14 +1,19 @@
+import logging
 import re
+import time
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI
 from openai import APIError, APITimeoutError, RateLimitError
 from pydantic import BaseModel, Field
 
 from src.core.config import settings
 from src.core.errors import MissingAPIKeyError
+from src.rag.vision import answer_with_images
+
+logger = logging.getLogger(__name__)
 
 PROMPT_SYSTEM = """You are a precise document Q&A assistant. You answer strictly from the context you are given —
 never from general knowledge, and never by guessing to fill a gap.
@@ -21,6 +26,10 @@ bullet/numbered list kept intact as one unit — treat every item in it as belon
 Rules:
 - Use only facts present in the context. If the context doesn't contain the answer, say so plainly — do not
   hedge into a partial guess.
+- Do not construct a "likely" or "probably" interpretation by inferring from adjacent, superficially-related
+  content (e.g. a nearby rating scale, an unrelated table, a logo) — those are not evidence for what an unrelated
+  term means unless the context explicitly states it. "In many contexts, X typically means Y" is general
+  knowledge, not this document's content, and does not belong in the answer even as a caveated guess.
 - Every claim in your answer must be traceable to a specific chunk. Cite as "(document name, page N)" inline,
   right after the sentence it supports — not bundled into one citation at the end.
 - If the context mixes multiple source documents, keep facts from different documents clearly separated and
@@ -123,17 +132,12 @@ def _render_table(table):
     return f"{markdown}\n\n_Source: {table.citation}_"
 
 
-def build_table_chain(retriever, llm):
+def build_table_chain(llm):
     # Structured JSON (entities + features + full cell grid + citation) needs more
     # headroom than a short prose answer, or the model truncates mid-table.
     structured_llm = llm.bind(max_tokens=900).with_structured_output(ExtractedTable)
     prompt = ChatPromptTemplate.from_template(TABLE_PROMPT_TEMPLATE)
-    return (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        | prompt
-        | structured_llm
-        | RunnableLambda(_render_table)
-    )
+    return prompt | structured_llm | RunnableLambda(_render_table)
 
 
 def load_llm():
@@ -172,21 +176,89 @@ def format_docs(docs):
     return "\n\n---\n\n".join(parts)
 
 
-def build_rag_chain(retriever, llm):
+def _load_picture_images(docs, limit=3):
+    """Read the persisted crop (see document_parser._process_pictures) for each
+    picture-type Document, deduped and capped — a multimodal call gets slower and
+    pricier per image, and a query rarely needs more than a couple of figures."""
+    images = []
+    seen = set()
+    for d in docs:
+        image_path, doc_hash = d.metadata.get("image_path"), d.metadata.get("doc_hash")
+        if not image_path or not doc_hash or (doc_hash, image_path) in seen:
+            continue
+        seen.add((doc_hash, image_path))
+        try:
+            images.append((settings.cache_dir / doc_hash / "pictures" / image_path).read_bytes())
+        except OSError:
+            continue
+        if len(images) >= limit:
+            break
+    return images
+
+
+NOT_GROUNDED_ANSWER = (
+    "I don't have a confident answer to that in the currently active document(s) — the closest matches "
+    "weren't actually relevant to the question. Double-check the right document is active, or try rephrasing."
+)
+
+
+def _is_grounded(docs):
+    if not docs:
+        return False
+    # Not every retriever path attaches relevance_score (only the reranked/graph-expanded
+    # ones do, via retriever.ScoredCrossEncoderReranker) — treat "no score available" as
+    # grounded rather than refusing, so this only gates the paths that can actually judge it.
+    scores = [d.metadata["relevance_score"] for d in docs if "relevance_score" in d.metadata]
+    return not scores or max(scores) >= settings.min_relevance_score
+
+
+def build_rag_chain(retriever, llm, vision_llm=None, sources_box=None):
     prose_prompt = ChatPromptTemplate.from_messages([("system", PROMPT_SYSTEM), ("human", PROMPT_TEMPLATE)])
-    prose_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        | prose_prompt
-        # 300 tokens truncated multi-item list answers mid-sentence; prose answers need
-        # more headroom than a one-line fact but not as much as a full structured table.
-        | llm.bind(max_tokens=650)
-        | StrOutputParser()
-    )
-    table_chain = build_table_chain(retriever, llm)
+    # 300 tokens truncated multi-item list answers mid-sentence; prose answers need more
+    # headroom than a one-line fact but not as much as a full structured table.
+    prose_llm_chain = prose_prompt | llm.bind(max_tokens=650) | StrOutputParser()
+    table_chain = build_table_chain(llm)
 
     def route(question):
-        chain = table_chain if is_table_request(question) else prose_chain
-        return chain.invoke(question)
+        t0 = time.perf_counter()
+        # Retrieve once, up front, for every branch (table/vision/prose) — this is also
+        # what makes the groundedness gate below possible: it needs the actual retrieved
+        # Documents (and their relevance scores) before committing to any answer path.
+        docs = retriever.invoke(question)
+        t_retrieve = time.perf_counter()
+        logger.info("timing: retrieval+rerank took %.2fs", t_retrieve - t0)
+
+        if not _is_grounded(docs):
+            if sources_box is not None:
+                sources_box["items"] = []  # don't cite chunks the answer isn't actually using
+            return NOT_GROUNDED_ANSWER
+
+        if is_table_request(question):
+            result = table_chain.invoke({"context": format_docs(docs), "question": question})
+            logger.info("timing: table LLM call took %.2fs", time.perf_counter() - t_retrieve)
+            return result
+
+        context = format_docs(docs)
+
+        # content_type=="picture" in the top results means the question is about a
+        # figure — hand Qwen3-VL-8B the real image alongside the text context instead
+        # of just a caption of it.
+        picture_docs = [d for d in docs if d.metadata.get("content_type") == "picture"]
+        if picture_docs and vision_llm is not None:
+            images = _load_picture_images(picture_docs)
+            t_images = time.perf_counter()
+            logger.info("timing: loaded %d picture(s) from disk in %.2fs", len(images), t_images - t_retrieve)
+            if images:
+                try:
+                    result = answer_with_images(vision_llm, question, context, images)
+                    logger.info("timing: vision LLM call took %.2fs", time.perf_counter() - t_images)
+                    return result
+                except (RateLimitError, APITimeoutError, APIError):
+                    logger.warning("Vision model call failed; falling back to text-only answer", exc_info=True)
+
+        result = prose_llm_chain.invoke({"context": context, "question": question})
+        logger.info("timing: prose LLM call took %.2fs", time.perf_counter() - t_retrieve)
+        return result
 
     return RunnableLambda(route)
 

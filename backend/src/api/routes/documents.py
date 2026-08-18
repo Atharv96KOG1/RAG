@@ -1,7 +1,9 @@
 import hashlib
 import logging
+import mimetypes
+from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from src.api.schemas.documents import (
@@ -11,13 +13,17 @@ from src.api.schemas.documents import (
     DocumentListResponse,
 )
 from src.api.state import state
+from src.core.auth import get_current_user
 from src.core.config import settings
 from src.core.errors import RagError
+from src.rag.document_parser import IMAGE_EXTENSIONS
 from src.rag.pipeline import build_combined_chain, ingest_document
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
+
+ALLOWED_EXTENSIONS = {".pdf"} | IMAGE_EXTENSIONS
 
 
 def _ingest_in_background(file_hash: str, dest_path):
@@ -45,15 +51,18 @@ def _ingest_in_background(file_hash: str, dest_path):
     doc["graph_status"] = "ready" if entry.get("graph") is not None else "failed"
 
 
-@router.get("", response_model=DocumentListResponse)
+@router.get("", response_model=DocumentListResponse, dependencies=[Depends(get_current_user)])
 def list_documents():
     return DocumentListResponse(documents=state.document_list(), active_hashes=state.active_hashes)
 
 
-@router.post("", response_model=DocumentListResponse)
+@router.post("", response_model=DocumentListResponse, dependencies=[Depends(get_current_user)])
 def upload_document(file: UploadFile, background_tasks: BackgroundTasks):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    if Path(file.filename).suffix.lower() not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF and image files (PNG, JPG, TIFF, BMP, WEBP) are supported.",
+        )
 
     file_bytes = file.file.read()
     file_hash = hashlib.md5(file_bytes).hexdigest()[:16]
@@ -80,16 +89,29 @@ def get_document_file(file_hash: str):
     if doc is None:
         raise HTTPException(status_code=404, detail="Unknown document hash.")
     # content_disposition_type="inline" — FileResponse defaults to "attachment", which
-    # makes the browser download the PDF instead of rendering it in the preview <iframe>.
+    # makes the browser download the file instead of rendering it in the preview <iframe>.
+    media_type = mimetypes.guess_type(doc["filename"])[0] or "application/octet-stream"
     return FileResponse(
         doc["source_path"],
-        media_type="application/pdf",
+        media_type=media_type,
         filename=doc["filename"],
         content_disposition_type="inline",
     )
 
 
-@router.delete("/{file_hash}", response_model=DocumentListResponse)
+@router.get("/{file_hash}/pictures/{filename}")
+def get_document_picture(file_hash: str, filename: str):
+    if file_hash not in state.documents:
+        raise HTTPException(status_code=404, detail="Unknown document hash.")
+    # Path(filename).name strips any directory components (e.g. "../../etc/passwd")
+    # a caller might pass — only ever serve a bare file from this doc's own pictures dir.
+    path = settings.cache_dir / file_hash / "pictures" / Path(filename).name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Image not found.")
+    return FileResponse(path, media_type="image/png")
+
+
+@router.delete("/{file_hash}", response_model=DocumentListResponse, dependencies=[Depends(get_current_user)])
 def remove_document(file_hash: str):
     state.documents.pop(file_hash, None)
     if file_hash in state.active_hashes:
@@ -102,7 +124,7 @@ def remove_document(file_hash: str):
     return DocumentListResponse(documents=state.document_list(), active_hashes=state.active_hashes)
 
 
-@router.post("/activate", response_model=ActivateResponse)
+@router.post("/activate", response_model=ActivateResponse, dependencies=[Depends(get_current_user)])
 def activate_documents(request: ActivateRequest):
     if len(request.hashes) > MAX_ACTIVE_DOCUMENTS:
         raise HTTPException(status_code=400, detail=f"At most {MAX_ACTIVE_DOCUMENTS} documents can be active.")
