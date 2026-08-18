@@ -26,13 +26,6 @@ logger = logging.getLogger(__name__)
 
 
 def ingest_document(source_path, embeddings):
-    """Parse -> chunk -> embed -> index -> graph-extract a single PDF. Cache and Milvus
-    collection are keyed off the file's content hash (src.config.cache_paths_for), so
-    ingesting a different file never reuses another document's parsed data, and
-    ingesting the same file twice (e.g. re-selecting it) reuses the existing collection
-    and graph instead of re-embedding/re-extracting. Returns everything needed to fold
-    this doc into a combined retriever, but does not build a retriever/chain itself —
-    call build_combined_chain for that."""
     paths = cache_paths_for(source_path)
     source_name = Path(source_path).name
 
@@ -46,7 +39,7 @@ def ingest_document(source_path, embeddings):
 
     for lc_doc in lc_documents:
         lc_doc.metadata["source_file"] = source_name
-        lc_doc.metadata["doc_hash"] = paths["key"]  # lets the frontend build a /api/documents/{hash}/file preview link
+        lc_doc.metadata["doc_hash"] = paths["key"]
 
     logger.info("[%s] embedding %d chunks", source_name, len(lc_documents))
     vectorstore = build_vectorstore(lc_documents, embeddings, paths["collection_name"])
@@ -59,9 +52,6 @@ def ingest_document(source_path, embeddings):
             graph = build_document_graph(chunk_texts, chunk_metas, source_name, llm)
             cache_graph(graph, paths["graph"])
         except Exception:
-            # Graph extraction is additive (powers the graph-expanded retriever and the
-            # Graph tab) — never let it fail the whole ingest. Chat still works off the
-            # vector/BM25 retriever alone; the frontend just shows graph_status: "failed".
             logger.exception("Graph extraction failed for %s; continuing without it", source_path)
             graph = None
 
@@ -86,11 +76,6 @@ def _merge_doc_metadata(ingested_docs):
 
 
 def build_combined_chain(ingested_docs, device):
-    """Fold 1-4 already-ingested docs into one retriever/chain. Each doc keeps its own
-    Milvus collection (built in ingest_document) — combining them for dense retrieval
-    means one retriever per collection, ensembled together, rather than a single
-    shared collection, so per-doc isolation (re-ingest doesn't disturb other docs)
-    is preserved even when querying across several at once."""
     if not ingested_docs:
         raise ValueError("build_combined_chain requires at least one ingested document")
 
@@ -114,9 +99,6 @@ def build_combined_chain(ingested_docs, device):
         )
         graph_for_wide = combined_graph
     else:
-        # No doc in this selection has a usable graph (all extraction failed, e.g. no
-        # API key at ingest time) — degrade to the plain hybrid+rerank retriever rather
-        # than erroring. Static empty box: nothing to highlight in the Graph tab.
         retriever, cross_encoder = build_reranked_retriever(hybrid_retriever, device, len(ingested_docs))
         touched_box = {"node_ids": []}
         graph_for_wide = None
@@ -124,14 +106,6 @@ def build_combined_chain(ingested_docs, device):
     sources_box = {"items": []}
     retriever = capture_sources(retriever, sources_box)
 
-    # Table/comparison questions need a wider retrieval pass than a single-fact question
-    # (see retriever.build_wide_table_retriever) — reuses the same already-loaded
-    # cross_encoder, shares sources_box so a table answer's citations still populate.
-    # A separate, wider hybrid_retriever is required here too: the graph-expansion
-    # seed pool downstream can only ever be as large as what the dense+BM25 ensemble
-    # itself returns, so widening seed_k/expand_limit alone hit a ceiling — verified
-    # directly (seed count stayed at the narrow dense_retriever_k+bm25_retriever_k cap
-    # even after tripling seed_k) until this was widened too.
     multiplier = settings.table_retrieval_breadth_multiplier
     wide_hybrid_retriever = make_hybrid_retriever(
         round(settings.dense_retriever_k * multiplier), round(settings.bm25_retriever_k * multiplier)
@@ -149,8 +123,6 @@ def build_combined_chain(ingested_docs, device):
 
 
 def build_pipeline(source_path):
-    """Single-document convenience wrapper kept for the CLI: ingest one PDF and
-    build a chain over it alone."""
     device = get_device()
     embeddings = load_embeddings(device)
     entry = ingest_document(source_path, embeddings)

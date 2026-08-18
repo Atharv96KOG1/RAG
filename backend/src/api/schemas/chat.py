@@ -6,8 +6,6 @@ class ChatRequest(BaseModel):
 
 
 class BoundingBox(BaseModel):
-    # Fractions (0-1) of the page's own width/height — resolution-independent, so the
-    # frontend can position a highlight over a PDF.js-rendered page at any zoom level.
     left: float
     top: float
     width: float

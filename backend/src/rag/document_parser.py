@@ -18,10 +18,6 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
 
 def picture_image_filename(item):
-    """Deterministic filename from a PictureItem's self_ref (e.g. "#/pictures/0") —
-    shared with chunker.py so a picture chunk's metadata can point at the exact same
-    file _process_pictures persisted, without needing to thread a path through the
-    docling Document itself."""
     return item.self_ref.strip("#/").replace("/", "_") + ".png"
 
 
@@ -35,10 +31,6 @@ def parse_document(source_path, cache_path):
 
     convert_path = source_path
     if Path(source_path).suffix.lower() in IMAGE_EXTENSIONS:
-        # A tilted/rotated photo (phone snapshot, scanned-at-an-angle page) tanks
-        # OCR accuracy well before it becomes visually obvious, and docling has no
-        # deskew step of its own — straighten it up front so both Tesseract and the
-        # layout/table models see an upright, level page.
         convert_path = _deskew_image(Path(source_path))
 
     pipeline_options = PdfPipelineOptions()
@@ -46,18 +38,13 @@ def parse_document(source_path, cache_path):
     pipeline_options.ocr_options = TesseractCliOcrOptions(force_full_page_ocr=False)
     pipeline_options.do_table_structure = True
     pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE
-    pipeline_options.generate_picture_images = True  # keep raster crops so we can OCR/caption each picture directly
-    pipeline_options.images_scale = 2.0  # higher-res crops = better OCR accuracy on small in-image text
-    pipeline_options.do_picture_description = False  # replaced by Qwen3-VL-8B in _process_pictures below —
-    # the local SmolVLM-256M was too weak to describe a dense diagram's actual structure/relationships
+    pipeline_options.generate_picture_images = True
+    pipeline_options.images_scale = 2.0
+    pipeline_options.do_picture_description = False
 
     converter = DocumentConverter(
         format_options={
             InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
-            # Images route through the same OCR/table/picture-description pipeline as
-            # PDFs — do_ocr=True full-page-OCRs the image itself since there's no
-            # separate text layer to fall back on, so a scanned photo/screenshot gets
-            # the same literal-text extraction a scanned PDF page would.
             InputFormat.IMAGE: ImageFormatOption(pipeline_options=pipeline_options),
         }
     )
@@ -81,12 +68,6 @@ def parse_document(source_path, cache_path):
 
 
 def _deskew_image(source_path):
-    """Straighten a photographed/scanned image before OCR: first correct any
-    90/180/270 rotation via Tesseract's orientation detection (OSD), then correct
-    fine skew (a few degrees off-level) via OpenCV's minimum-area-rect over the
-    text mask. Writes the corrected image next to the original and returns its
-    path; returns the original path untouched if nothing needed fixing or
-    detection failed (better to OCR a tilted image than crash the upload)."""
     image = cv2.imread(str(source_path))
     if image is None:
         return source_path
@@ -110,7 +91,7 @@ def _deskew_image(source_path):
     angle = -(90 + angle) if angle < -45 else -angle
 
     if rotate_angle == 0 and abs(angle) < 0.3:
-        return source_path  # already level enough — skip a no-op re-encode
+        return source_path
 
     if abs(angle) >= 0.3:
         image = _rotate_bound(image, angle)
@@ -121,8 +102,6 @@ def _deskew_image(source_path):
 
 
 def _rotate_bound(image, angle):
-    """Rotate by `angle` degrees around center, expanding the canvas so corners
-    aren't clipped (plain cv2.warpAffine on the original size would crop them)."""
     h, w = image.shape[:2]
     cx, cy = w / 2, h / 2
     matrix = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
@@ -141,14 +120,6 @@ def _image_to_png_bytes(image):
 
 
 def _process_pictures(doc, pictures_dir):
-    """For every picture in the doc: persist its crop to disk (so the API can serve
-    the actual image back to the frontend, not just a text description of it), run
-    Tesseract on the crop for literal in-image text (docling's page-level OCR skips
-    text baked into picture bitmaps), and caption it with Qwen3-VL-8B (see
-    src.rag.vision) for a real structural description — box labels, connections,
-    flow — that the local SmolVLM captioner was too weak to produce. Both text
-    sources are attached as DescriptionAnnotations so chunker.chunk_document surfaces
-    them, and the persisted file lets retriever.py point a chat citation at the image."""
     vision_llm = load_vision_llm()
     pictures_dir.mkdir(parents=True, exist_ok=True)
     tesseract_available = True

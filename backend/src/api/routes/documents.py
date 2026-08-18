@@ -26,10 +26,6 @@ ALLOWED_EXTENSIONS = {".pdf"} | IMAGE_EXTENSIONS
 
 
 def _ingest_in_background(file_hash: str, dest_path):
-    """Runs off the request thread (scheduled via BackgroundTasks) so a large PDF's
-    parse/chunk/embed/graph-extract pass never blocks the upload HTTP response or the
-    single in-memory `state` for other requests. Never raises — failures are recorded
-    on state.documents so the frontend can show them instead of the request just hanging."""
     doc = state.documents[file_hash]
     try:
         entry = ingest_document(str(dest_path), state.embeddings)
@@ -84,8 +80,7 @@ def get_document_file(file_hash: str):
     doc = state.documents.get(file_hash)
     if doc is None:
         raise HTTPException(status_code=404, detail="Unknown document hash.")
-    # content_disposition_type="inline" — FileResponse defaults to "attachment", which
-    # makes the browser download the file instead of rendering it in the preview <iframe>.
+
     media_type = mimetypes.guess_type(doc["filename"])[0] or "application/octet-stream"
     return FileResponse(
         doc["source_path"],
@@ -99,8 +94,7 @@ def get_document_file(file_hash: str):
 def get_document_picture(file_hash: str, filename: str):
     if file_hash not in state.documents:
         raise HTTPException(status_code=404, detail="Unknown document hash.")
-    # Path(filename).name strips any directory components (e.g. "../../etc/passwd")
-    # a caller might pass — only ever serve a bare file from this doc's own pictures dir.
+
     path = settings.cache_dir / file_hash / "pictures" / Path(filename).name
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Image not found.")
@@ -137,9 +131,7 @@ def activate_documents(request: ActivateRequest):
 
     entries = [state.documents[h]["entry"] for h in request.hashes]
     try:
-        rag_chain, doc_metadata, combined_graph, touched_box, sources_box = build_combined_chain(
-            entries, state.device
-        )
+        rag_chain, doc_metadata, combined_graph, touched_box, sources_box = build_combined_chain(entries, state.device)
     except RagError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

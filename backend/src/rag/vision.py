@@ -41,9 +41,6 @@ def _b64_data_url(image_bytes):
 
 
 def load_vision_llm():
-    """Returns None (not an error) when no OpenRouter key is configured — multimodal
-    captioning/answering is additive on top of the text-only pipeline, so its absence
-    should degrade gracefully rather than block ingestion or chat."""
     if not settings.openrouter_api_key:
         return None
     return ChatOpenAI(

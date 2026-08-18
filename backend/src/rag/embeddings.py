@@ -24,9 +24,7 @@ def load_embeddings(device=None):
         encode_kwargs={"normalize_embeddings": True, "batch_size": 32},
         query_instruction="",
     )
-    # Try local cache first so a dead/DNS-less network can't hang or crash
-    # ingestion on the optional adapter_config.json probe; only go online if
-    # the model truly isn't cached yet.
+
     try:
         os.environ["HF_HUB_OFFLINE"] = "1"
         return HuggingFaceBgeEmbeddings(**kwargs)

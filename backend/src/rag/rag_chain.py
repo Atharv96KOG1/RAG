@@ -86,12 +86,6 @@ META_QUESTION_PATTERNS = {
 
 
 class ExtractedTable(BaseModel):
-    """Structured shape for a table answer. Forcing this schema (instead of letting the
-    LLM freeform a markdown table) is what guarantees a clean, consistent grid — a plain
-    prompt instruction is easy for the model to ignore once it starts mixing prose and
-    table together. Row/column orientation itself is NOT fixed here; the prompt decides
-    which dimension goes where per-question, this schema just captures the result."""
-
     row_label: str = Field(description="What the rows represent, e.g. 'Leave Type', 'Feature', 'Vendor Section'.")
     rows: list[str] = Field(description="The row values for that dimension, grounded in the context.")
     columns: list[str] = Field(description="The column headers (the other dimension), grounded in the context.")
@@ -122,8 +116,7 @@ def _render_table(table):
     header = f"| {table.row_label} | " + " | ".join(table.columns) + " | Row source (page) |"
     separator = "|---" * (len(table.columns) + 2) + "|"
     rendered_rows = []
-    # strict=False: an LLM-returned table can have mismatched rows/cells/row_sources
-    # lengths (e.g. it forgot a row's source) — truncate to the shortest rather than error.
+
     for row_label, row, source in zip(table.rows, table.cells, row_sources, strict=False):
         values = list(row) + ["Not specified"] * (len(table.columns) - len(row))
         rendered_rows.append(f"| {row_label} | " + " | ".join(values[: len(table.columns)]) + f" | {source} |")
@@ -133,8 +126,7 @@ def _render_table(table):
 
 
 def build_table_chain(llm):
-    # Structured JSON (entities + features + full cell grid + citation) needs more
-    # headroom than a short prose answer, or the model truncates mid-table.
+
     structured_llm = llm.bind(max_tokens=900).with_structured_output(ExtractedTable)
     prompt = ChatPromptTemplate.from_template(TABLE_PROMPT_TEMPLATE)
     return prompt | structured_llm | RunnableLambda(_render_table)
@@ -149,7 +141,7 @@ def load_llm():
     return ChatOpenAI(
         model=settings.llm_model_name,
         api_key=api_key,
-        max_tokens=650,  # overridden per-chain via .bind() where a different budget is needed
+        max_tokens=650,
         temperature=0,
     )
 
@@ -160,7 +152,7 @@ _CONTENT_TYPE_TAGS = {"table": "TABLE", "picture": "FIGURE", "list": "LIST", "te
 def _content_tag(metadata):
     if "content_type" in metadata:
         return _CONTENT_TYPE_TAGS.get(metadata.get("content_type"), "TEXT")
-    # Fallback for any caller still only setting the older has_table/has_picture flags.
+
     return "TABLE" if metadata.get("has_table") else ("FIGURE" if metadata.get("has_picture") else "TEXT")
 
 
@@ -177,9 +169,6 @@ def format_docs(docs):
 
 
 def _load_picture_images(docs, limit=3):
-    """Read the persisted crop (see document_parser._process_pictures) for each
-    picture-type Document, deduped and capped — a multimodal call gets slower and
-    pricier per image, and a query rarely needs more than a couple of figures."""
     images = []
     seen = set()
     for d in docs:
@@ -205,37 +194,30 @@ NOT_GROUNDED_ANSWER = (
 def _is_grounded(docs):
     if not docs:
         return False
-    # Not every retriever path attaches relevance_score (only the reranked/graph-expanded
-    # ones do, via retriever.ScoredCrossEncoderReranker) — treat "no score available" as
-    # grounded rather than refusing, so this only gates the paths that can actually judge it.
+
     scores = [d.metadata["relevance_score"] for d in docs if "relevance_score" in d.metadata]
     return not scores or max(scores) >= settings.min_relevance_score
 
 
 def build_rag_chain(retriever, llm, vision_llm=None, sources_box=None, wide_retriever=None):
     prose_prompt = ChatPromptTemplate.from_messages([("system", PROMPT_SYSTEM), ("human", PROMPT_TEMPLATE)])
-    # 300 tokens truncated multi-item list answers mid-sentence; prose answers need more
-    # headroom than a one-line fact but not as much as a full structured table.
+
     prose_llm_chain = prose_prompt | llm.bind(max_tokens=650) | StrOutputParser()
     table_chain = build_table_chain(llm)
 
     def route(question):
         t0 = time.perf_counter()
         is_table = is_table_request(question)
-        # A table/comparison question needs a wider retrieval pass than a single-fact
-        # question does (see retriever.build_wide_table_retriever) — falls back to the
-        # standard retriever if no wide variant was built (e.g. in tests/CLI use).
+
         active_retriever = wide_retriever if (is_table and wide_retriever is not None) else retriever
-        # Retrieve once, up front, for every branch (table/vision/prose) — this is also
-        # what makes the groundedness gate below possible: it needs the actual retrieved
-        # Documents (and their relevance scores) before committing to any answer path.
+
         docs = active_retriever.invoke(question)
         t_retrieve = time.perf_counter()
         logger.info("timing: retrieval+rerank took %.2fs", t_retrieve - t0)
 
         if not _is_grounded(docs):
             if sources_box is not None:
-                sources_box["items"] = []  # don't cite chunks the answer isn't actually using
+                sources_box["items"] = []
             return NOT_GROUNDED_ANSWER
 
         if is_table:
@@ -245,9 +227,6 @@ def build_rag_chain(retriever, llm, vision_llm=None, sources_box=None, wide_retr
 
         context = format_docs(docs)
 
-        # content_type=="picture" in the top results means the question is about a
-        # figure — hand Qwen3-VL-8B the real image alongside the text context instead
-        # of just a caption of it.
         picture_docs = [d for d in docs if d.metadata.get("content_type") == "picture"]
         if picture_docs and vision_llm is not None:
             images = _load_picture_images(picture_docs)
