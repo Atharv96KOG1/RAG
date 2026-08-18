@@ -1,0 +1,32 @@
+# Environment
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Backend runtime artifacts (regenerable — see backend/src/core/config.py)
+backend/cache/
+backend/data/*.pdf
+
+# Stray artifact from a misfired git-clone command (creates a literal path from the URL
+# instead of cloning into it) — not part of the project, never intended to be tracked.
+backend/https:/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+# Notebook scratch cache
+notebooks/*.cache*.pkl
+notebooks/*.cache*.json
+notebooks/document.cache.pkl
+notebooks/chunks.cache.json
+notebooks/*.txt
+
+# OS
+.DS_Store
