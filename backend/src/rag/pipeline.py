@@ -7,7 +7,12 @@ from src.rag.document_parser import document_metadata, parse_document
 from src.rag.embeddings import get_device, load_embeddings
 from src.rag.graph_builder import build_combined_graph, build_document_graph, cache_graph, load_cached_graph
 from src.rag.rag_chain import build_rag_chain, load_llm
-from src.rag.retriever import build_graph_expanded_retriever, build_reranked_retriever, capture_sources
+from src.rag.retriever import (
+    build_graph_expanded_retriever,
+    build_reranked_retriever,
+    build_wide_table_retriever,
+    capture_sources,
+)
 from src.rag.vector_store import build_vectorstore
 from src.rag.vision import load_vision_llm
 
@@ -29,23 +34,27 @@ def ingest_document(source_path, embeddings):
     this doc into a combined retriever, but does not build a retriever/chain itself —
     call build_combined_chain for that."""
     paths = cache_paths_for(source_path)
+    source_name = Path(source_path).name
 
+    logger.info("[%s] parsing document", source_name)
     doc = parse_document(source_path, paths["document"])
     doc_metadata = document_metadata(doc)
 
+    logger.info("[%s] chunking document", source_name)
     chunk_texts, chunk_metas = chunk_document(doc, paths["chunks"])
     lc_documents = to_langchain_documents(chunk_texts, chunk_metas)
 
-    source_name = Path(source_path).name
     for lc_doc in lc_documents:
         lc_doc.metadata["source_file"] = source_name
         lc_doc.metadata["doc_hash"] = paths["key"]  # lets the frontend build a /api/documents/{hash}/file preview link
 
+    logger.info("[%s] embedding %d chunks", source_name, len(lc_documents))
     vectorstore = build_vectorstore(lc_documents, embeddings, paths["collection_name"])
 
     graph = load_cached_graph(paths["graph"])
     if graph is None:
         try:
+            logger.info("[%s] extracting graph", source_name)
             llm = load_llm()
             graph = build_document_graph(chunk_texts, chunk_metas, source_name, llm)
             cache_graph(graph, paths["graph"])
@@ -56,6 +65,7 @@ def ingest_document(source_path, embeddings):
             logger.exception("Graph extraction failed for %s; continuing without it", source_path)
             graph = None
 
+    logger.info("[%s] ingest complete", source_name)
     return {
         "source_file": source_name,
         "cache_key": paths["key"],
@@ -86,35 +96,54 @@ def build_combined_chain(ingested_docs, device):
 
     lc_documents = [lc_doc for entry in ingested_docs for lc_doc in entry["lc_documents"]]
 
-    dense_retrievers = [
-        entry["vectorstore"].as_retriever(search_kwargs={"k": settings.dense_retriever_k}) for entry in ingested_docs
-    ]
-    bm25_retriever = BM25Retriever.from_documents(lc_documents)
-    bm25_retriever.k = settings.bm25_retriever_k
+    def make_hybrid_retriever(dense_k, bm25_k):
+        dense_retrievers = [entry["vectorstore"].as_retriever(search_kwargs={"k": dense_k}) for entry in ingested_docs]
+        bm25_retriever = BM25Retriever.from_documents(lc_documents)
+        bm25_retriever.k = bm25_k
+        dense_weight, bm25_weight = settings.hybrid_weights
+        weights = [dense_weight / len(dense_retrievers)] * len(dense_retrievers) + [bm25_weight]
+        return EnsembleRetriever(retrievers=dense_retrievers + [bm25_retriever], weights=weights)
 
-    dense_weight, bm25_weight = settings.hybrid_weights
-    weights = [dense_weight / len(dense_retrievers)] * len(dense_retrievers) + [bm25_weight]
-    hybrid_retriever = EnsembleRetriever(retrievers=dense_retrievers + [bm25_retriever], weights=weights)
+    hybrid_retriever = make_hybrid_retriever(settings.dense_retriever_k, settings.bm25_retriever_k)
 
     combined_graph = build_combined_graph([entry.get("graph") for entry in ingested_docs])
 
     if combined_graph.number_of_nodes() > 0:
-        retriever, touched_box = build_graph_expanded_retriever(
+        retriever, touched_box, cross_encoder = build_graph_expanded_retriever(
             hybrid_retriever, combined_graph, lc_documents, device, len(ingested_docs)
         )
+        graph_for_wide = combined_graph
     else:
         # No doc in this selection has a usable graph (all extraction failed, e.g. no
         # API key at ingest time) — degrade to the plain hybrid+rerank retriever rather
         # than erroring. Static empty box: nothing to highlight in the Graph tab.
-        retriever = build_reranked_retriever(hybrid_retriever, device, len(ingested_docs))
+        retriever, cross_encoder = build_reranked_retriever(hybrid_retriever, device, len(ingested_docs))
         touched_box = {"node_ids": []}
+        graph_for_wide = None
 
     sources_box = {"items": []}
     retriever = capture_sources(retriever, sources_box)
 
+    # Table/comparison questions need a wider retrieval pass than a single-fact question
+    # (see retriever.build_wide_table_retriever) — reuses the same already-loaded
+    # cross_encoder, shares sources_box so a table answer's citations still populate.
+    # A separate, wider hybrid_retriever is required here too: the graph-expansion
+    # seed pool downstream can only ever be as large as what the dense+BM25 ensemble
+    # itself returns, so widening seed_k/expand_limit alone hit a ceiling — verified
+    # directly (seed count stayed at the narrow dense_retriever_k+bm25_retriever_k cap
+    # even after tripling seed_k) until this was widened too.
+    multiplier = settings.table_retrieval_breadth_multiplier
+    wide_hybrid_retriever = make_hybrid_retriever(
+        round(settings.dense_retriever_k * multiplier), round(settings.bm25_retriever_k * multiplier)
+    )
+    wide_retriever = build_wide_table_retriever(
+        wide_hybrid_retriever, graph_for_wide, lc_documents, device, len(ingested_docs), cross_encoder
+    )
+    wide_retriever = capture_sources(wide_retriever, sources_box)
+
     llm = load_llm()
-    vision_llm = load_vision_llm()  # None if OPENROUTER_API_KEY isn't set — falls back to text-only answers
-    rag_chain = build_rag_chain(retriever, llm, vision_llm, sources_box)
+    vision_llm = load_vision_llm()
+    rag_chain = build_rag_chain(retriever, llm, vision_llm, sources_box, wide_retriever=wide_retriever)
 
     return rag_chain, _merge_doc_metadata(ingested_docs), combined_graph, touched_box, sources_box
 

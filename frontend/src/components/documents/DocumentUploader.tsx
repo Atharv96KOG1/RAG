@@ -1,22 +1,29 @@
 import { useCallback, useRef, useState } from "react";
 import type { DragEvent } from "react";
-import { UploadIcon } from "../icons";
+import { ImageIcon, UploadIcon } from "../icons";
+
+const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"];
+const ACCEPTED_EXTENSIONS = [".pdf", ...IMAGE_EXTENSIONS];
 
 interface Props {
   onUpload: (file: File) => void;
   uploading: boolean;
 }
 
+function isAcceptedFile(file: File) {
+  const name = file.name.toLowerCase();
+  return file.type === "application/pdf" || file.type.startsWith("image/") || ACCEPTED_EXTENSIONS.some((ext) => name.endsWith(ext));
+}
+
 export function DocumentUploader({ onUpload, uploading }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const ocrInputRef = useRef<HTMLInputElement>(null);
   const [dragOver, setDragOver] = useState(false);
 
   const handleFiles = useCallback(
     (files: FileList | null) => {
       if (!files) return;
-      Array.from(files)
-        .filter((f) => f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf"))
-        .forEach(onUpload);
+      Array.from(files).filter(isAcceptedFile).forEach(onUpload);
     },
     [onUpload],
   );
@@ -45,7 +52,7 @@ export function DocumentUploader({ onUpload, uploading }: Props) {
       <input
         ref={inputRef}
         type="file"
-        accept="application/pdf"
+        accept={[...ACCEPTED_EXTENSIONS, "application/pdf", "image/*"].join(",")}
         multiple
         className="hidden"
         onChange={(e) => {
@@ -67,11 +74,35 @@ export function DocumentUploader({ onUpload, uploading }: Props) {
         )}
       </div>
       <p className="text-sm font-medium" style={{ color: "var(--ink)" }}>
-        {uploading ? "Processing…" : "Drop PDFs or click to upload"}
+        {uploading ? "Processing…" : "Drop PDFs/images or click to upload"}
       </p>
       <p className="text-xs" style={{ color: "var(--muted)" }}>
-        Parsed, chunked, embedded, and indexed automatically
+        Parsed, OCR'd, chunked, embedded, and indexed automatically
       </p>
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          ocrInputRef.current?.click();
+        }}
+        className="mt-1 flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium transition-colors hover:opacity-80"
+        style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+      >
+        <ImageIcon width={13} height={13} />
+        OCR Image
+      </button>
+      <input
+        ref={ocrInputRef}
+        type="file"
+        accept={[...IMAGE_EXTENSIONS, "image/*"].join(",")}
+        multiple
+        className="hidden"
+        onClick={(e) => e.stopPropagation()}
+        onChange={(e) => {
+          handleFiles(e.target.files);
+          e.target.value = "";
+        }}
+      />
     </div>
   );
 }

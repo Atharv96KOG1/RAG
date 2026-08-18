@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import type { ChatMessage, SourceCitation } from "../../types";
+import type { ChatMessage, PreviewTarget } from "../../types";
 import { MessageBubble } from "./MessageBubble";
 import { TypingIndicator } from "./TypingIndicator";
 import { EmptyState } from "./EmptyState";
@@ -9,7 +9,7 @@ interface Props {
   sending: boolean;
   hasActiveDocuments: boolean;
   hasDocuments: boolean;
-  onPreview?: (source: SourceCitation) => void;
+  onPreview?: (target: PreviewTarget) => void;
 }
 
 export function ChatWindow({ messages, sending, hasActiveDocuments, hasDocuments, onPreview }: Props) {

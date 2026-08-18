@@ -212,7 +212,7 @@ def _is_grounded(docs):
     return not scores or max(scores) >= settings.min_relevance_score
 
 
-def build_rag_chain(retriever, llm, vision_llm=None, sources_box=None):
+def build_rag_chain(retriever, llm, vision_llm=None, sources_box=None, wide_retriever=None):
     prose_prompt = ChatPromptTemplate.from_messages([("system", PROMPT_SYSTEM), ("human", PROMPT_TEMPLATE)])
     # 300 tokens truncated multi-item list answers mid-sentence; prose answers need more
     # headroom than a one-line fact but not as much as a full structured table.
@@ -221,10 +221,15 @@ def build_rag_chain(retriever, llm, vision_llm=None, sources_box=None):
 
     def route(question):
         t0 = time.perf_counter()
+        is_table = is_table_request(question)
+        # A table/comparison question needs a wider retrieval pass than a single-fact
+        # question does (see retriever.build_wide_table_retriever) — falls back to the
+        # standard retriever if no wide variant was built (e.g. in tests/CLI use).
+        active_retriever = wide_retriever if (is_table and wide_retriever is not None) else retriever
         # Retrieve once, up front, for every branch (table/vision/prose) — this is also
         # what makes the groundedness gate below possible: it needs the actual retrieved
         # Documents (and their relevance scores) before committing to any answer path.
-        docs = retriever.invoke(question)
+        docs = active_retriever.invoke(question)
         t_retrieve = time.perf_counter()
         logger.info("timing: retrieval+rerank took %.2fs", t_retrieve - t0)
 
@@ -233,7 +238,7 @@ def build_rag_chain(retriever, llm, vision_llm=None, sources_box=None):
                 sources_box["items"] = []  # don't cite chunks the answer isn't actually using
             return NOT_GROUNDED_ANSWER
 
-        if is_table_request(question):
+        if is_table:
             result = table_chain.invoke({"context": format_docs(docs), "question": question})
             logger.info("timing: table LLM call took %.2fs", time.perf_counter() - t_retrieve)
             return result

@@ -1,5 +1,27 @@
 export const API_BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
+const TOKEN_STORAGE_KEY = "auth_token";
+
+export function getToken() {
+  return localStorage.getItem(TOKEN_STORAGE_KEY);
+}
+
+export function setToken(token: string) {
+  localStorage.setItem(TOKEN_STORAGE_KEY, token);
+}
+
+export function clearToken() {
+  localStorage.removeItem(TOKEN_STORAGE_KEY);
+}
+
+// App.tsx sets this once, at mount, so a 401 from anywhere (token expired, cleared
+// server-side, never set) can kick the user back to the login screen without every
+// call site having to check for it individually.
+let onUnauthorized: (() => void) | null = null;
+export function setUnauthorizedHandler(handler: () => void) {
+  onUnauthorized = handler;
+}
+
 export class ApiRequestError extends Error {
   status: number;
 
@@ -11,7 +33,11 @@ export class ApiRequestError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, init);
+  const token = getToken();
+  const headers = new Headers(init?.headers);
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+
+  const response = await fetch(`${API_BASE_URL}${path}`, { ...init, headers });
 
   if (!response.ok) {
     let detail = response.statusText;
@@ -20,6 +46,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       detail = body?.detail ?? detail;
     } catch {
       // Response wasn't JSON — fall back to statusText already assigned above.
+    }
+    if (response.status === 401 && path !== "/api/auth/login") {
+      clearToken();
+      onUnauthorized?.();
     }
     throw new ApiRequestError(detail, response.status);
   }

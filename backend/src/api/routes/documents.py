@@ -3,7 +3,7 @@ import logging
 import mimetypes
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from src.api.schemas.documents import (
@@ -13,7 +13,6 @@ from src.api.schemas.documents import (
     DocumentListResponse,
 )
 from src.api.state import state
-from src.core.auth import get_current_user
 from src.core.config import settings
 from src.core.errors import RagError
 from src.rag.document_parser import IMAGE_EXTENSIONS
@@ -51,18 +50,15 @@ def _ingest_in_background(file_hash: str, dest_path):
     doc["graph_status"] = "ready" if entry.get("graph") is not None else "failed"
 
 
-@router.get("", response_model=DocumentListResponse, dependencies=[Depends(get_current_user)])
+@router.get("", response_model=DocumentListResponse)
 def list_documents():
     return DocumentListResponse(documents=state.document_list(), active_hashes=state.active_hashes)
 
 
-@router.post("", response_model=DocumentListResponse, dependencies=[Depends(get_current_user)])
+@router.post("", response_model=DocumentListResponse)
 def upload_document(file: UploadFile, background_tasks: BackgroundTasks):
     if Path(file.filename).suffix.lower() not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF and image files (PNG, JPG, TIFF, BMP, WEBP) are supported.",
-        )
+        raise HTTPException(status_code=400, detail="Only PDF or image files (PNG/JPG/TIFF/BMP/WEBP) are supported.")
 
     file_bytes = file.file.read()
     file_hash = hashlib.md5(file_bytes).hexdigest()[:16]
@@ -111,7 +107,7 @@ def get_document_picture(file_hash: str, filename: str):
     return FileResponse(path, media_type="image/png")
 
 
-@router.delete("/{file_hash}", response_model=DocumentListResponse, dependencies=[Depends(get_current_user)])
+@router.delete("/{file_hash}", response_model=DocumentListResponse)
 def remove_document(file_hash: str):
     state.documents.pop(file_hash, None)
     if file_hash in state.active_hashes:
@@ -124,7 +120,7 @@ def remove_document(file_hash: str):
     return DocumentListResponse(documents=state.document_list(), active_hashes=state.active_hashes)
 
 
-@router.post("/activate", response_model=ActivateResponse, dependencies=[Depends(get_current_user)])
+@router.post("/activate", response_model=ActivateResponse)
 def activate_documents(request: ActivateRequest):
     if len(request.hashes) > MAX_ACTIVE_DOCUMENTS:
         raise HTTPException(status_code=400, detail=f"At most {MAX_ACTIVE_DOCUMENTS} documents can be active.")

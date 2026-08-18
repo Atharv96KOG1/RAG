@@ -66,42 +66,56 @@ def _scaled_top_n(num_docs):
     return min(12, settings.rerank_top_n + 2 * (num_docs - 1))
 
 
-def build_reranked_retriever(hybrid_retriever, device, num_docs=1):
+def _load_cross_encoder(device, warm_up_batch_size):
     cross_encoder = HuggingFaceCrossEncoder(
         model_name=settings.reranker_model_name,
         model_kwargs={"device": device, "max_length": settings.reranker_max_length},
     )
-    _warm_up(cross_encoder, settings.dense_retriever_k + settings.bm25_retriever_k)
-    reranker = ScoredCrossEncoderReranker(model=cross_encoder, top_n=_scaled_top_n(num_docs))
-    return ContextualCompressionRetriever(base_compressor=reranker, base_retriever=hybrid_retriever)
+    _warm_up(cross_encoder, warm_up_batch_size)
+    return cross_encoder
+
+
+def build_reranked_retriever(hybrid_retriever, device, num_docs=1, cross_encoder=None, top_n=None):
+    """cross_encoder can be passed in to reuse an already-loaded model (e.g. for a
+    second, wider-recall retriever variant — see build_wide_table_retriever) instead of
+    paying its load+warm-up cost twice. top_n overrides the doc-count-scaled default
+    for the same reason."""
+    if cross_encoder is None:
+        cross_encoder = _load_cross_encoder(device, settings.dense_retriever_k + settings.bm25_retriever_k)
+    reranker = ScoredCrossEncoderReranker(model=cross_encoder, top_n=top_n if top_n is not None else _scaled_top_n(num_docs))
+    return ContextualCompressionRetriever(base_compressor=reranker, base_retriever=hybrid_retriever), cross_encoder
 
 
 def _chunk_key(doc):
     return f"chunk:{doc.metadata.get('source_file')}:{doc.metadata.get('chunk_index')}"
 
 
-def build_graph_expanded_retriever(hybrid_retriever, graph, lc_documents, device, num_docs):
+def build_graph_expanded_retriever(
+    hybrid_retriever, graph, lc_documents, device, num_docs, cross_encoder=None, top_n=None, seed_k=None, expand_limit=None
+):
     """GraphRAG local-search retrieval: seed from the plain (unreranked) hybrid ensemble,
     1-hop expand through the entity graph to pull in chunks connected via a shared
     entity that the vector/BM25 search alone missed, dedup, then rerank the union once.
-    Returns (retriever, touched_box) — touched_box["node_ids"] is overwritten on every
-    call with the chunk+entity node ids the final answer actually drew on, read by
-    routes/graph.py to highlight the last query's subgraph without threading the query
-    result through `state` from inside this module."""
+    Returns (retriever, touched_box, cross_encoder) — touched_box["node_ids"] is
+    overwritten on every call with the chunk+entity node ids the final answer actually
+    drew on, read by routes/graph.py to highlight the last query's subgraph without
+    threading the query result through `state` from inside this module. cross_encoder
+    is returned so a second, wider-recall variant (see build_wide_table_retriever) can
+    reuse the same loaded model instead of loading it twice; top_n/seed_k/expand_limit
+    override the doc-count-scaled defaults for that same variant."""
     doc_lookup = {_chunk_key(doc): doc for doc in lc_documents if doc.metadata.get("chunk_index") is not None}
+    seed_k = seed_k if seed_k is not None else settings.graph_seed_k
+    expand_limit = expand_limit if expand_limit is not None else settings.graph_expand_limit
 
-    cross_encoder = HuggingFaceCrossEncoder(
-        model_name=settings.reranker_model_name,
-        model_kwargs={"device": device, "max_length": settings.reranker_max_length},
-    )
-    _warm_up(cross_encoder, settings.graph_seed_k + settings.graph_expand_limit)
-    reranker = ScoredCrossEncoderReranker(model=cross_encoder, top_n=_scaled_top_n(num_docs))
+    if cross_encoder is None:
+        cross_encoder = _load_cross_encoder(device, settings.graph_seed_k + settings.graph_expand_limit)
+    reranker = ScoredCrossEncoderReranker(model=cross_encoder, top_n=top_n if top_n is not None else _scaled_top_n(num_docs))
 
     touched_box = {"node_ids": []}
 
     def expand_and_rerank(query):
         t0 = time.perf_counter()
-        seed_docs = hybrid_retriever.invoke(query)[: settings.graph_seed_k]
+        seed_docs = hybrid_retriever.invoke(query)[:seed_k]
         t_hybrid = time.perf_counter()
         logger.info("timing: hybrid (dense+BM25) retrieval took %.2fs", t_hybrid - t0)
         seed_keys = {_chunk_key(d) for d in seed_docs}
@@ -116,10 +130,10 @@ def build_graph_expanded_retriever(hybrid_retriever, graph, lc_documents, device
                 for neighbor_key in graph.predecessors(entity_id):
                     if neighbor_key not in seed_keys and graph.nodes.get(neighbor_key, {}).get("kind") == "chunk":
                         expanded_keys.add(neighbor_key)
-            if len(expanded_keys) >= settings.graph_expand_limit:
+            if len(expanded_keys) >= expand_limit:
                 break
 
-        expanded_docs = [doc_lookup[k] for k in list(expanded_keys)[: settings.graph_expand_limit] if k in doc_lookup]
+        expanded_docs = [doc_lookup[k] for k in list(expanded_keys)[:expand_limit] if k in doc_lookup]
         candidates = seed_docs + expanded_docs
         t_expand = time.perf_counter()
         logger.info(
@@ -148,7 +162,39 @@ def build_graph_expanded_retriever(hybrid_retriever, graph, lc_documents, device
 
         return reranked
 
-    return RunnableLambda(expand_and_rerank), touched_box
+    return RunnableLambda(expand_and_rerank), touched_box, cross_encoder
+
+
+def build_wide_table_retriever(hybrid_retriever, graph, lc_documents, device, num_docs, cross_encoder):
+    """A table/comparison question ("compare all leave types") is fundamentally
+    different from a single-fact question: it names or implies MULTIPLE distinct
+    entities, and a single query embedding doesn't match each entity's own section as
+    strongly as a question aimed at just one of them would. Verified directly against a
+    real document: the standard top_n=8 retrieval for "compare all leave types" surfaced
+    only 5 of 8 actual leave-type sections, silently producing "Not specified" for the
+    other 3 — not a hallucination, a recall gap. table_retrieval_breadth_multiplier
+    scales seed/expand/top_n proportionally (not a new flat magic count) specifically
+    for this query shape, reusing the already-loaded cross_encoder so it costs one
+    extra rerank pass, not a second model load."""
+    multiplier = settings.table_retrieval_breadth_multiplier
+    top_n = min(30, round(_scaled_top_n(num_docs) * multiplier))
+    if graph is not None and graph.number_of_nodes() > 0:
+        retriever, _touched_box, _ce = build_graph_expanded_retriever(
+            hybrid_retriever,
+            graph,
+            lc_documents,
+            device,
+            num_docs,
+            cross_encoder=cross_encoder,
+            top_n=top_n,
+            seed_k=round(settings.graph_seed_k * multiplier),
+            expand_limit=round(settings.graph_expand_limit * multiplier),
+        )
+        return retriever
+    retriever, _ce = build_reranked_retriever(
+        hybrid_retriever, device, num_docs, cross_encoder=cross_encoder, top_n=top_n
+    )
+    return retriever
 
 
 def _bbox_from_metadata(metadata):
@@ -166,6 +212,43 @@ def _bbox_from_metadata(metadata):
     }
 
 
+REL_SCORE_NEUTRAL = 0.5  # sigmoid(0) — bge-reranker-v2-m3's own "no signal" point, not a tuned constant
+
+# Observed across multiple test documents/questions: a genuinely relevant chunk scores
+# 0.54-0.7+; a chunk with no real connection to the question clusters right at
+# 0.500-0.502 regardless of document. When even the BEST candidate for a query falls in
+# that noise band, "half of the top's confidence above neutral" (the relative rule
+# below) is still noise — a query with nothing relevant needs zero citations, not its
+# least-noisy candidate. This is the floor that catches that case.
+_MIN_TOP_SCORE_FOR_ANY_CITATION = 0.55
+
+
+def citation_relevance_cutoff(scores):
+    """Per-query citation bar: a doc must retain at least citation_relevance_fraction
+    of THIS query's own top match's confidence above the reranker's neutral point. The
+    reranker's top_n (8-12) always returns that many candidates even when only 1-2 are
+    actually relevant, and a flat absolute cutoff can't tell a weak-but-real match from
+    noise clustered just above 0.5 — scaling the bar to the query's own top score can.
+    But that alone breaks when the whole candidate set is uniformly weak (every score
+    sits in the noise band) — _MIN_TOP_SCORE_FOR_ANY_CITATION catches that by requiring
+    the top score itself to clear the noise band before anything is cited at all."""
+    if not scores or max(scores) < _MIN_TOP_SCORE_FOR_ANY_CITATION:
+        return float("inf")
+    top = max(scores)
+    return REL_SCORE_NEUTRAL + (top - REL_SCORE_NEUTRAL) * settings.citation_relevance_fraction
+
+
+def _passes_relevance_gate(metadata, cutoff):
+    # A stricter bar than rag_chain._is_grounded's min_relevance_score — that gate only
+    # asks "is the single best candidate good enough to attempt an answer at all"
+    # (deliberately loose to avoid false refusals). Citing a source is a stronger claim
+    # ("the answer came from this page"), so every individual citation needs its own
+    # score at or above this query's citation_relevance_cutoff. A doc with no
+    # relevance_score (a retriever path that doesn't score) still passes.
+    score = metadata.get("relevance_score")
+    return score is None or score >= cutoff
+
+
 def capture_sources(retriever, box, snippet_len=240):
     """Wraps any retriever (graph-expanded or the plain fallback) so the exact Documents
     it returns for a query are also recorded into box["items"] — used by routes/chat.py
@@ -174,6 +257,9 @@ def capture_sources(retriever, box, snippet_len=240):
 
     def fn(query):
         docs = retriever.invoke(query)
+        cutoff = citation_relevance_cutoff(
+            [d.metadata["relevance_score"] for d in docs if "relevance_score" in d.metadata]
+        )
         box["items"] = [
             {
                 "source_file": d.metadata.get("source_file"),
@@ -190,6 +276,7 @@ def capture_sources(retriever, box, snippet_len=240):
                 "bbox": _bbox_from_metadata(d.metadata),
             }
             for d in docs
+            if _passes_relevance_gate(d.metadata, cutoff)
         ]
         return docs
 

@@ -124,8 +124,8 @@ def test_ocr_pictures_missing_tesseract_binary_degrades_gracefully(tmp_path, mon
             buf.write(b"fake-png-bytes")
 
     class FakePicture:
-        self_ref = "#/pictures/0"
         annotations = []
+        self_ref = "#/pictures/0"
 
         def get_image(self, doc):
             return FakeImage()
@@ -135,7 +135,7 @@ def test_ocr_pictures_missing_tesseract_binary_degrades_gracefully(tmp_path, mon
             return iter([(FakePicture(), 0)])
 
     monkeypatch.setattr(document_parser, "PictureItem", FakePicture)
-    monkeypatch.setattr(document_parser, "load_vision_llm", lambda: None)  # no real API call in a unit test
+    monkeypatch.setattr(document_parser, "load_vision_llm", lambda: None)
 
     def raise_not_found(image):
         raise pytesseract.TesseractNotFoundError()

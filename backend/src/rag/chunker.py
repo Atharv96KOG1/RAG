@@ -44,6 +44,70 @@ def _item_page(item):
     return item.prov[0].page_no if item.prov else None
 
 
+# Milvus VARCHAR fields hard-cap at 65535 bytes (2^16-1) — the database's own ceiling.
+# A markdown-exported table with enough rows (or a docling table-structure
+# misdetection merging several logical tables into one TableItem) can exceed that in a
+# single chunk, which crashed the whole ingest with a MilvusException instead of
+# failing just that one document.
+_MAX_TABLE_TEXT_BYTES = 60_000
+
+
+def _split_oversized_table_markdown(markdown, tokenizer):
+    """Split an over-limit markdown table into several self-contained pieces, each
+    repeating the header/separator row so every piece still reads as a valid, complete
+    table on its own (not just an arbitrary text truncation). Bounded by BOTH real
+    constraints downstream, not just one: Milvus's byte cap (above), and — the one
+    that actually crashed ingestion — the embedding model's own token context window.
+    HybridChunker already token-limits every other chunk type to settings.chunk_max_tokens
+    via this same tokenizer; a table's markdown was the one text type that bypassed
+    that (chunker splits by structure, not by size, for tables), so a big table could
+    reach tens of thousands of tokens — self-attention memory scales quadratically with
+    sequence length, which is what exhausted MPS memory on a real document's table."""
+    max_tokens = tokenizer.max_tokens
+    if len(markdown.encode("utf-8")) <= _MAX_TABLE_TEXT_BYTES and tokenizer.count_tokens(markdown) <= max_tokens:
+        return [markdown]
+
+    lines = markdown.splitlines()
+    if len(lines) < 3:
+        # Not actually a header+separator+rows table (or a single giant row) — nothing
+        # structured to split on. Hard-truncate at a safe UTF-8 boundary as a last
+        # resort so ingestion never crashes, even though this loses that row's tail.
+        encoded = markdown.encode("utf-8")[: _MAX_TABLE_TEXT_BYTES - 20]
+        return [encoded.decode("utf-8", errors="ignore") + "\n\n[...truncated: row exceeded storage limit]"]
+
+    header, separator, rows = lines[0], lines[1], lines[2:]
+    header_bytes = len(header.encode("utf-8")) + len(separator.encode("utf-8")) + 2
+    header_tokens = tokenizer.count_tokens(f"{header}\n{separator}")
+
+    pieces = []
+    current_rows, current_bytes, current_tokens = [], header_bytes, header_tokens
+    for row in rows:
+        row_bytes = len(row.encode("utf-8")) + 1
+        row_tokens = tokenizer.count_tokens(row)
+        if current_rows and (
+            current_bytes + row_bytes > _MAX_TABLE_TEXT_BYTES or current_tokens + row_tokens > max_tokens
+        ):
+            pieces.append("\n".join([header, separator, *current_rows]))
+            current_rows, current_bytes, current_tokens = [], header_bytes, header_tokens
+        if header_bytes + row_bytes > _MAX_TABLE_TEXT_BYTES or header_tokens + row_tokens > max_tokens:
+            # A single row alone would still overflow — truncate just that row rather
+            # than the whole table. Truncate by tokens first (the tighter of the two
+            # real limits in practice), then re-check the byte cap.
+            while row and tokenizer.count_tokens(row) + header_tokens > max_tokens:
+                row = row[: max(1, len(row) // 2)]
+            row = row.encode("utf-8")[: _MAX_TABLE_TEXT_BYTES - header_bytes - 20].decode("utf-8", errors="ignore")
+            row += "…"
+            row_bytes = len(row.encode("utf-8")) + 1
+            row_tokens = tokenizer.count_tokens(row)
+        current_rows.append(row)
+        current_bytes += row_bytes
+        current_tokens += row_tokens
+    if current_rows:
+        pieces.append("\n".join([header, separator, *current_rows]))
+
+    return pieces or [markdown]
+
+
 _EMPTY_BBOX = {"left": 0.0, "top": 0.0, "width": 0.0, "height": 0.0}
 
 
@@ -120,12 +184,37 @@ def chunk_document(doc, cache_path):
         picture_items = [item for kind, item in filter(None, resolved) if kind == "picture"]
 
         if table_items:
-            text = "\n\n".join(t.export_to_markdown(doc) for t in table_items)
+            # Each table gets split independently (not the joined "\n\n" text) so a
+            # split boundary never lands mid-table when several tables share one chunk.
+            table_texts = [
+                piece
+                for t in table_items
+                for piece in _split_oversized_table_markdown(t.export_to_markdown(doc), chunker.tokenizer)
+            ]
             content_type = "table"
             image_filename = ""  # not None — Milvus infers a metadata field's schema type from its
             # sampled values, and can't infer one from an all-None/mostly-None field (this is a
             # picture-only field, so most chunks have nothing here); "" is falsy just like None for
             # every `if image_path` check downstream, but gives Milvus a stable VARCHAR to infer.
+            bbox = _chunk_bbox_fraction(doc_items, doc, page)
+            for text in table_texts:
+                bodies.append(text)
+                chunk_metas.append(
+                    {
+                        "chunk_index": len(bodies) - 1,
+                        "page": page,
+                        "headings": headings,
+                        "content_type": content_type,
+                        "has_table": True,
+                        "has_picture": False,
+                        "image_path": image_filename,
+                        "bbox_left": bbox["left"],
+                        "bbox_top": bbox["top"],
+                        "bbox_width": bbox["width"],
+                        "bbox_height": bbox["height"],
+                    }
+                )
+            continue
         elif picture_items:
             picture_texts = [_picture_text(p, doc) for p in picture_items]
             picture_texts = [t for t in picture_texts if t]

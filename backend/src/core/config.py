@@ -29,14 +29,6 @@ class Settings(BaseSettings):
     openrouter_api_key: str | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     vision_model_name: str = "qwen/qwen3-vl-8b-instruct"
-    # Single shared login (no user DB) — matches this app's existing single-tenant
-    # design (see api/state.py's own comment on that). Every non-auth route requires
-    # a valid JWT issued by POST /api/auth/login against these credentials.
-    jwt_secret_key: str = "change-me"
-    jwt_algorithm: str = "HS256"
-    jwt_expire_minutes: int = 1440
-    auth_username: str = "admin"
-    auth_password: str = "admin"
     milvus_uri: str = "http://localhost:19530"
     collection_prefix: str = "rag_doc_"
     data_dir: Path = BASE_DIR / "data"
@@ -62,12 +54,35 @@ class Settings(BaseSettings):
     # chain refuses instead of generating from context that doesn't support the
     # question, which is what let an unrelated chunk get hallucinated into an answer.
     min_relevance_score: float = 0.15
+    # bge-reranker-v2-m3's raw logit is 0 when it finds a chunk exactly as relevant as
+    # not — sigmoid(0) = 0.5, so 0.5 (REL_SCORE_NEUTRAL below) is the model's own
+    # neutral point, not a tuned constant. A genuinely irrelevant chunk clusters right
+    # at ~0.500-0.501 (positive-but-negligible raw logit) — a flat cutoff just above
+    # 0.5 still let that noise through, since it's indistinguishable from a weak-but-
+    # real match by any single fixed number. Instead, a citation must retain at least
+    # this fraction of the query's OWN top match's confidence above neutral — the bar
+    # scales with how confident the reranker actually is on this specific query, rather
+    # than a magic absolute score copied from one example. See retriever.py's
+    # citation_relevance_cutoff for the formula.
+    citation_relevance_fraction: float = 0.5
     graph_entity_types: list[str] = ["person", "organization", "product", "location", "concept", "date", "other"]
     graph_overlap_entity_types: list[str] = ["person", "organization", "product", "location"]
     graph_group_max_tokens: int = 2500
     graph_extraction_concurrency: int = 5
     graph_seed_k: int = 15
     graph_expand_limit: int = 10
+    # A table/comparison question ("compare all leave types") names or implies MULTIPLE
+    # distinct entities, unlike a single-fact question — verified directly against a
+    # real document that the standard retrieval breadth silently dropped several of the
+    # named entities from a "compare all X" answer (not a hallucination — those entities
+    # were never even retrieved). This scales seed/expand/top_n proportionally for that
+    # query shape specifically (see retriever.build_wide_table_retriever), reusing the
+    # already-loaded reranker rather than a second model load.
+    table_retrieval_breadth_multiplier: float = 3.0
+    # Caps CPU threads used by local torch inference (embedding/reranker models) —
+    # trades ingest/query speed for less CPU heat without touching model weights or
+    # outputs. None (default) leaves torch's own auto-detected thread count as-is.
+    torch_thread_limit: int | None = None
 
 
 settings = Settings()

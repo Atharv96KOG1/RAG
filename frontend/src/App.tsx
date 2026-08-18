@@ -5,20 +5,35 @@ import { ChatWindow } from "./components/chat/ChatWindow";
 import { ChatInput } from "./components/chat/ChatInput";
 import { PdfPreviewModal } from "./components/chat/PdfPreviewModal";
 import { GraphView } from "./components/graph/GraphView";
+import { LoginScreen } from "./components/auth/LoginScreen";
+import { LogoutIcon } from "./components/icons";
 import { useDocuments } from "./hooks/useDocuments";
 import { useChat } from "./hooks/useChat";
 import { useGraph } from "./hooks/useGraph";
+import { useAuth } from "./hooks/useAuth";
 import { MAX_ACTIVE_DOCUMENTS } from "./constants";
-import type { SourceCitation } from "./types";
+import type { PreviewTarget } from "./types";
 
 function App() {
+  const auth = useAuth();
+
+  if (!auth.isAuthenticated) {
+    return <LoginScreen onLogin={auth.login} loggingIn={auth.loggingIn} error={auth.error} />;
+  }
+
+  // Mounted only once logged in — useDocuments/useChat/useGraph fetch on mount, and
+  // doing that requires a token already being in place, not racing against login.
+  return <AppShell onLogout={auth.logout} />;
+}
+
+function AppShell({ onLogout }: { onLogout: () => void }) {
   const docs = useDocuments();
   const chat = useChat();
   const graph = useGraph();
 
   const [selected, setSelected] = useState<string[]>([]);
   const [tab, setTab] = useState<"chat" | "graph">("chat");
-  const [preview, setPreview] = useState<SourceCitation | null>(null);
+  const [preview, setPreview] = useState<PreviewTarget | null>(null);
   const initializedFromServer = useRef(false);
 
   // Seed local selection from whatever the backend already had active (e.g. after
@@ -120,6 +135,16 @@ function App() {
               No active documents
             </span>
           )}
+
+          <button
+            onClick={onLogout}
+            className="ml-auto flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium transition-colors hover:opacity-80"
+            style={{ color: "var(--muted)" }}
+            title="Log out"
+          >
+            <LogoutIcon width={13} height={13} />
+            Log out
+          </button>
         </header>
 
         {error && <ErrorBanner message={error} onDismiss={dismissError} />}
@@ -145,6 +170,7 @@ function App() {
           docHash={preview.doc_hash}
           filename={preview.source_file ?? "Document"}
           page={preview.page}
+          bboxes={preview.bboxes}
           onClose={() => setPreview(null)}
         />
       )}
